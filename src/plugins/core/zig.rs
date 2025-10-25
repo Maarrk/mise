@@ -9,6 +9,7 @@ use crate::cli::args::BackendArg;
 use crate::cli::version::OS;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
+use crate::duration::DAILY;
 use crate::file::TarOptions;
 use crate::http::{HTTP, HTTP_FETCH};
 use crate::install_context::InstallContext;
@@ -29,6 +30,7 @@ pub struct ZigPlugin {
 
 const ZIG_MINISIGN_KEY: &str = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
 const REQUEST_SUFFIX: &str = "?source=mise-en-place";
+const MIRRORS_FILENAME: &str = "community-mirrors.txt";
 
 impl ZigPlugin {
     pub fn new() -> Self {
@@ -94,10 +96,15 @@ impl ZigPlugin {
 
         let mut downloaded = false;
         let mut used_url = url.clone();
-        if url.starts_with("https://ziglang.org") {
-            // The ziglang.org website kindly asks for trying mirrors for automated downloads,
-            // see more at: https://ziglang.org/download/community-mirrors/
-            let mirrors = self.get_community_mirrors().await?;
+        // The ziglang.org website kindly asks for trying mirrors for automated downloads,
+        // see more at: https://ziglang.org/download/community-mirrors/
+        let community_mirrors = if url.starts_with("https://ziglang.org") {
+            self.get_community_mirrors().await
+        } else {
+            None
+        };
+
+        if let Some(mirrors) = community_mirrors {
             for i in 0..mirrors.len() {
                 let disp_i = i + 1;
                 let disp_len = mirrors.len();
@@ -122,10 +129,12 @@ impl ZigPlugin {
         }
 
         if !downloaded {
-            // Fall back to ziglang.org or machengine.org download
+            // Try the usual ziglang.org or machengine.org download
             pr.set_message(format!("download {filename}"));
             used_url = url.clone();
             HTTP.download_file(&url, &tarball_path, Some(pr)).await?;
+            // If this was ziglang.org and error is not 404 and community_mirrors is None,
+            // the user might want to place the mirror list in cache dir by hand
         }
 
         pr.set_message(format!("minisign {filename}"));
@@ -190,10 +199,25 @@ impl ZigPlugin {
         Ok(zig_tarball_url.to_string())
     }
 
-    async fn get_community_mirrors(&self) -> Result<Vec<String>> {
-        let mirror_list = HTTP
-            .get_text("https://ziglang.org/download/community-mirrors.txt")
-            .await?; // TODO: Cache this daily in case of ziglang.org outage
+    async fn get_community_mirrors(&self) -> Option<Vec<String>> {
+        let cache_path = self.ba.cache_path.join(MIRRORS_FILENAME);
+        let recent_cache =
+            file::modified_duration(&cache_path).map_or(false, |updated_at| updated_at < DAILY);
+        if !recent_cache {
+            HTTP.download_file(
+                &format!("https://ziglang.org/download/{MIRRORS_FILENAME}"),
+                &cache_path,
+                None,
+            )
+            .await
+            .unwrap_or_else(|_| {
+                // We can still use an older mirror list
+                warn!("Could not download {MIRRORS_FILENAME}");
+                ()
+            });
+        }
+
+        let mirror_list = String::from_utf8(file::read(cache_path).ok()?).ok()?;
         let mut mirrors: Vec<String> = mirror_list
             .split('\n')
             .filter(|s| !s.is_empty())
@@ -201,7 +225,7 @@ impl ZigPlugin {
             .collect();
         let mut rng = rand::rng();
         mirrors.shuffle(&mut rng);
-        Ok(mirrors)
+        Some(mirrors)
     }
 }
 
